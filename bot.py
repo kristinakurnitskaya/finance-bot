@@ -1,10 +1,12 @@
 """
-Telegram bot: odbiera zdjęcia/tekst z sumą, pyta o typ/kategorię/konto, zapisuje do Notion.
-Uruchom: python bot.py (wymaga .env z TELEGRAM_BOT_TOKEN, NOTION_SECRET, NOTION_EXPENSES_DATABASE_ID).
+Telegram bot: odbiera zdjęcia/tekst z sumą, pyta o typ/kategorię/konto, zapisuje do Google Sheets.
+Uruchom: python bot.py (wymaga .env z TELEGRAM_BOT_TOKEN, GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON).
 """
+import asyncio
 import os
 import re
 from decimal import InvalidOperation, Decimal
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -18,9 +20,9 @@ from telegram.ext import (
     filters,
 )
 
-from notion_client import create_expense, create_income, create_transfer
+from sheets_client import append_expense, append_income, append_investment, append_transfer
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Stan „w trakcie dodawania” per użytkownik (chat_id)
 pending: dict[int, dict] = {}
@@ -34,7 +36,7 @@ CATEGORIES = [
     "Travels", "Clothes Paolo", "Clothes Kris", "Events", "Netflix",
     "Internet", "Documents", "Charities", "New page", "Relax",
 ]
-ACCOUNTS = ["Santander Paolo", "Santander Kris", "Revolut Paolo", "Revolut Kris", "Contanti"]
+ACCOUNTS = ["Revolut Paolo", "Revolut Kris", "Santander Paolo", "Santander Kris", "Cash", "Financial cushion", "Credit Card"]
 INCOME_SOURCES = ["Salary", "Sales", "Gifts", "From Parents"]
 
 
@@ -48,7 +50,7 @@ def parse_amount(text: str) -> Optional[float]:
 
 
 def get_photo_url(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> Optional[str]:
-    """Zwraca publiczny URL zdjęcia z Telegrama (do zapisu w Notion)."""
+    """Zwraca publiczny URL zdjęcia z Telegrama."""
     try:
         token = context.bot.token
         f = context.bot.get_file(file_id)
@@ -191,107 +193,96 @@ async def ask_transfer_to(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     pending[chat_id]["step"] = "transfer_to"
 
 
-async def save_to_notion_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _handle_expired_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Jeśli sesja wygasła, prosi o kwotę od nowa. Zwraca True jeśli wygasła."""
     chat_id = update.effective_chat.id
     if chat_id not in pending:
-        await update.callback_query.answer("Sessione scaduta. Usa /add.")
+        if update.callback_query:
+            await update.callback_query.message.reply_text(
+                "Sessione scaduta. Inviami l'importo (es. 45.50) oppure /add"
+            )
+        pending[chat_id] = {"step": "amount"}
+        return True
+    return False
+
+
+async def save_to_sheets_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if await _handle_expired_session(update, context):
         return
     data = pending[chat_id]
-    db_id = os.environ.get("NOTION_TRANSFERS_DATABASE_ID")
-    if not db_id or len(db_id) != 32:
-        await update.callback_query.answer("NOTION_TRANSFERS_DATABASE_ID mancante in .env", show_alert=True)
-        return
     try:
-        accounts_db_id = os.environ.get("NOTION_ACCOUNTS_DATABASE_ID")
-        create_transfer(
-            database_id=db_id,
-            comment=data.get("name") or "Trasferimento",
-            amount=float(data["amount"]),
-            from_account=data["from_account"],
-            to_account=data["to_account"],
-            accounts_database_id=accounts_db_id,
+        await asyncio.to_thread(
+            append_transfer,
+            data["from_account"],
+            data["to_account"],
+            float(data["amount"]),
+            data.get("name") or "Trasferimento",
         )
     except Exception as e:
-        print(f"[Bot] Błąd Notion (Transfers): {e}")
+        print(f"[Bot] Błąd Google Sheets (Transfer): {e}")
         err_msg = str(e)[:80]
-        await update.callback_query.answer(f"Notion: {err_msg}", show_alert=True)
+        await update.callback_query.message.reply_text(f"Errore: {err_msg}")
         return
     del pending[chat_id]
-    await update.callback_query.answer("Salvato in Notion (Transfer).")
-    await update.callback_query.message.reply_text("Salvato in Notion (Transfer).")
+    await update.callback_query.message.reply_text("Salvato in Google Sheets (Transfer).")
 
 
-async def save_to_notion_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def save_to_sheets_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    print(f"[Bot] save_to_notion_income dla chat_id={chat_id}")
-    if chat_id not in pending:
-        await update.callback_query.answer("Sessione scaduta. Usa /add.")
+    if await _handle_expired_session(update, context):
         return
     data = pending[chat_id]
-    db_id = os.environ.get("NOTION_INCOME_DATABASE_ID")
-    if not db_id or len(db_id) != 32:
-        print(f"[Bot] Brak NOTION_INCOME_DATABASE_ID (len={len(db_id or '')})")
-        await update.callback_query.answer("NOTION_INCOME_DATABASE_ID mancante in .env", show_alert=True)
-        return
     try:
-        accounts_db_id = os.environ.get("NOTION_ACCOUNTS_DATABASE_ID")
-        create_income(
-            database_id=db_id,
-            comment=data.get("name") or "Entrata",
-            amount=float(data["amount"]),
-            account=data["account"],
-            income_source=data.get("income_source", "Salary"),
-            accounts_database_id=accounts_db_id,
+        await asyncio.to_thread(
+            append_income,
+            data.get("income_source", "Salary"),
+            data["account"],
+            float(data["amount"]),
+            data.get("income_source", "Salary"),
+            data.get("name") or "Entrata",
         )
     except Exception as e:
-        print(f"[Bot] Błąd Notion (Income): {e}")
+        print(f"[Bot] Błąd Google Sheets (Income): {e}")
         err_msg = str(e)[:80]
-        await update.callback_query.answer(f"Notion: {err_msg}", show_alert=True)
+        await update.callback_query.message.reply_text(f"Errore: {err_msg}")
         return
     del pending[chat_id]
-    await update.callback_query.answer("Salvato in Notion (Income).")
-    await update.callback_query.message.reply_text("Salvato in Notion (Income).")
+    await update.callback_query.message.reply_text("Salvato in Google Sheets (Income).")
 
 
-async def save_to_notion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def save_to_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    if chat_id not in pending:
-        await update.callback_query.answer("Sessione scaduta. Usa /add.")
+    if await _handle_expired_session(update, context):
         return
 
     data = pending[chat_id]
-    db_id = os.environ.get("NOTION_EXPENSES_DATABASE_ID")
-    if not db_id:
-        await update.callback_query.answer("NOTION_EXPENSES_DATABASE_ID mancante.", show_alert=True)
-        return
-
-    photo_url = None
-    if data.get("photo_file_id"):
-        photo_url = get_photo_url(context, data["photo_file_id"])
-
+    note = data.get("name") or "Transazione"
     try:
-        accounts_db_id = os.environ.get("NOTION_ACCOUNTS_DATABASE_ID")
-        categories_db_id = os.environ.get("NOTION_CATEGORIES_DATABASE_ID")
-        create_expense(
-            database_id=db_id,
-            name=data.get("name") or "Transazione",
-            amount=float(data["amount"]),
-            transaction_type=data["type"],
-            category=data["category"],
-            account=data["account"],
-            photo_url=photo_url,
-            accounts_database_id=accounts_db_id,
-            categories_database_id=categories_db_id,
-        )
+        if data.get("type") == "Investimento":
+            await asyncio.to_thread(
+                append_investment,
+                data["category"],
+                data["account"],
+                float(data["amount"]),
+                note,
+            )
+        else:
+            await asyncio.to_thread(
+                append_expense,
+                data["category"],
+                data["account"],
+                float(data["amount"]),
+                note,
+            )
     except Exception as e:
-        print(f"[Bot] Błąd Notion (Expenses): {e}")
+        print(f"[Bot] Błąd Google Sheets (Expense): {e}")
         err_msg = str(e)[:80]
-        await update.callback_query.answer(f"Notion: {err_msg}", show_alert=True)
+        await update.callback_query.message.reply_text(f"Errore: {err_msg}")
         return
 
     del pending[chat_id]
-    await update.callback_query.answer("Salvato in Notion.")
-    await update.callback_query.message.reply_text("Salvato in Notion.")
+    await update.callback_query.message.reply_text("Salvato in Google Sheets.")
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -304,7 +295,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await q.answer()
     if chat_id not in pending:
-        await q.message.reply_text("Sessione scaduta. Usa /add.")
+        await q.message.reply_text("Sessione scaduta. Inviami l'importo (es. 45.50) oppure /add")
+        pending[chat_id] = {"step": "amount"}
         return
 
     data = pending[chat_id]
@@ -326,7 +318,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await ask_transfer_to(update, context)
     elif step == "transfer_to" and action == "to_acc":
         data["to_account"] = value
-        await save_to_notion_transfer(update, context)
+        await save_to_sheets_transfer(update, context)
     elif step == "category" and action == "cat":
         data["category"] = value
         await ask_account(update, context)
@@ -335,11 +327,10 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if data.get("type") == "Entrata":
             await ask_income_source(update, context)
         else:
-            await save_to_notion(update, context)
+            await save_to_sheets(update, context)
     elif step == "income_source" and action == "src":
         data["income_source"] = value
-        print(f"[Bot] Zapisuję Income: {value}")
-        await save_to_notion_income(update, context)
+        await save_to_sheets_income(update, context)
     else:
         print(f"[Bot] Callback nie dopasowany: step={step!r} action={action!r}")
 
@@ -366,9 +357,9 @@ def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     if not token or ":" not in token:
         raise SystemExit("Błąd: TELEGRAM_BOT_TOKEN w .env jest pusty lub w złym formacie.")
-    db_id = os.environ.get("NOTION_EXPENSES_DATABASE_ID", "")
-    if not db_id or len(db_id) != 32:
-        raise SystemExit("Błąd: NOTION_EXPENSES_DATABASE_ID w .env jest pusty lub nie ma 32 znaków.")
+    spreadsheet_id = os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID", "")
+    if not spreadsheet_id:
+        raise SystemExit("Błąd: GOOGLE_SHEETS_SPREADSHEET_ID w .env jest pusty.")
     print("Bot uruchomiony. Wyślij /start do bota w Telegramie.")
     print("(Ctrl+C = wyjście)\n")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
