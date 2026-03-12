@@ -1,15 +1,13 @@
 """
-Telegram bot: odbiera zdjęcia/tekst z sumą, pyta o typ/kategorię/konto, zapisuje do Google Sheets.
-Uruchom: python bot.py (wymaga .env z TELEGRAM_BOT_TOKEN, GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON).
+Telegram Finance Bot – records transactions step-by-step and saves to Google Sheets.
+Production-ready, deployable on Railway.
 """
 import asyncio
-import os
-import re
-from decimal import InvalidOperation, Decimal
-from pathlib import Path
-from typing import Optional
+import warnings
+from datetime import date
 
-from dotenv import load_dotenv
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*Python.*")
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -20,349 +18,358 @@ from telegram.ext import (
     filters,
 )
 
-from sheets_client import append_expense, append_income, append_investment, append_transfer
+import config
+from parser import parse_amount
+from sheets import (
+    append_transaction,
+    append_transfer,
+    get_accounts_from_sheet,
+    get_categories_from_sheet,
+    get_income_categories_from_sheet,
+    get_loans_from_sheet,
+)
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# --- Constants ---
 
-# Stan „w trakcie dodawania” per użytkownik (chat_id)
-pending: dict[int, dict] = {}
+TRANSACTION_TYPES = ["Expense", "Income", "Transfer", "Loan Payment"]
 
-# Listy do przycisków – dopasuj do swoich opcji w Notion (Select)
-TYPES = ["Spesa", "Entrata", "Investimento", "Trasferimento"]
 CATEGORIES = [
-    "Food", "Eating Out", "Gioia", "Taxi", "Transport",
-    "Treatments", "Cosmetics", "Health", "House", "Sport",
-    "Tech", "Learning", "Presents", "Bills", "Apartment",
-    "Travels", "Clothes Paolo", "Clothes Kris", "Events", "Netflix",
-    "Internet", "Documents", "Charities", "New page", "Relax",
+    "Food",
+    "Eating Out",
+    "Gioia",
+    "Taxi",
+    "Transport",
+    "Treatments",
+    "Cosmetics",
+    "Health",
+    "House",
+    "Sport",
+    "Tech",
+    "Learning",
+    "Presents",
+    "Bills",
+    "Apartment",
+    "Travels",
+    "Clothes Paolo",
+    "Clothes Kris",
+    "Events",
+    "Netflix",
+    "Documents",
+    "Charities",
+    "Relax",
+    "Internet",
 ]
-ACCOUNTS = ["Revolut Paolo", "Revolut Kris", "Santander Paolo", "Santander Kris", "Cash", "Financial cushion", "Credit Card"]
-INCOME_SOURCES = ["Salary", "Sales", "Gifts", "From Parents"]
+
+# Kategorie tylko dla Income (Salary, Sales, Gifts, From Parents + opcja nowa)
+INCOME_CATEGORIES = ["Salary", "Sales", "Gifts", "From Parents"]
+
+ACCOUNTS = [
+    "Revolut Paolo",
+    "Revolut Kris",
+    "Santander Paolo",
+    "Santander Kris",
+    "Cash",
+    "Financial cushion",
+    "Credit Card",
+]
+
+# In-memory state: chat_id -> {step, amount, currency, type, category, account, note}
+STATE: dict[int, dict] = {}
 
 
-def parse_amount(text: str) -> Optional[float]:
-    """Wyciąga liczbę z tekstu (np. 45,50 lub 45.50)."""
-    text = text.strip().replace(",", ".")
-    try:
-        return float(Decimal(text))
-    except (InvalidOperation, ValueError):
-        return None
-
-
-def get_photo_url(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> Optional[str]:
-    """Zwraca publiczny URL zdjęcia z Telegrama."""
-    try:
-        token = context.bot.token
-        f = context.bot.get_file(file_id)
-        return f"https://api.telegram.org/file/bot{token}/{f.file_path}"
-    except Exception:
-        return None
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    print(f"[Bot] /start od chat_id={update.effective_chat.id}")
-    await update.message.reply_text(
-        "Ciao! Invia una somma (es. 25.50) o una foto dello scontrino.\n"
-        "Comandi: /start – questo messaggio, /add – aggiungi transazione."
-    )
-
-
-async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Rozpoczyna dodawanie transakcji – prosi o sumę."""
-    pending[update.effective_chat.id] = {"step": "amount"}
-    await update.message.reply_text("Inviami l'importo (es. 45.50) o una foto.")
-
-
-def keyboard(items: list[str], prefix: str, cols: int = 2) -> InlineKeyboardMarkup:
-    """Przyciski inline (prefix:value), w rzędach po cols."""
-    flat = [InlineKeyboardButton(name, callback_data=f"{prefix}:{name}") for name in items]
-    rows = [flat[i : i + cols] for i in range(0, len(flat), cols)]
+def _keyboard(items: list[str], prefix: str, cols: int = 2) -> InlineKeyboardMarkup:
+    """Build inline keyboard with prefix for callback_data."""
+    buttons = [InlineKeyboardButton(x, callback_data=f"{prefix}:{x}") for x in items]
+    rows = [buttons[i : i + cols] for i in range(0, len(buttons), cols)]
     return InlineKeyboardMarkup(rows)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    msg = update.message
-    text = (msg.text or "").strip()
-    print(f"[Bot] Wiadomość od {chat_id}: zdjęcie={bool(msg.photo)} tekst={repr(text)[:50]}")
+# --- Handlers ---
 
-    # Zdjęcie
-    if msg.photo:
-        pending[chat_id] = {
-            "step": "amount",
-            "photo_file_id": msg.photo[-1].file_id,
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Send an amount to record a transaction.\n\n"
+        "Examples:\n"
+        "12\n"
+        "12.50\n"
+        "50 EUR\n"
+        "100 USD"
+    )
+
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+
+    # No active transaction – expect amount
+    if chat_id not in STATE:
+        result = parse_amount(text)
+        if result is None:
+            await update.message.reply_text(
+                "Please send a valid amount.\n\n"
+                "Examples:\n"
+                "12\n"
+                "12.50\n"
+                "50 EUR\n"
+                "100 USD"
+            )
+            return
+        amount, currency = result
+        STATE[chat_id] = {
+            "step": "type",
+            "amount": amount,
+            "currency": currency,
         }
-        await msg.reply_text("Foto ricevuta. Inviami l'importo (es. 12.50).")
+        await update.message.reply_text(
+            "What type of transaction is this?",
+            reply_markup=_keyboard(TRANSACTION_TYPES, "type", cols=2),
+        )
         return
 
-    # Tekst
-    if chat_id not in pending or pending[chat_id].get("step") != "amount":
-        amount = parse_amount(text)
-        if amount is not None and amount > 0:
-            pending[chat_id] = {"step": "amount", "amount": amount, "name": text[:200]}
-            print(f"[Bot] Kwota OK, wysyłam Tipo? do {chat_id}")
-            try:
-                await ask_type(update, context)
-            except Exception as e:
-                print(f"[Bot] Błąd w ask_type: {e}")
-                await msg.reply_text(f"Errore: {e}")
-        else:
-            await msg.reply_text("Invia un importo (es. 45.50) o una foto, oppure /add")
+    data = STATE[chat_id]
+    step = data.get("step")
+
+    if step == "income_category_new":
+        # User wpisał nazwę nowej kategorii dla Income → pytamy o konto
+        data["category"] = text[:200] if text else "Other"
+        data["step"] = "account"
+        accounts = await asyncio.to_thread(get_accounts_from_sheet)
+        await update.message.reply_text(
+            "Select account",
+            reply_markup=_keyboard(accounts or ACCOUNTS, "acc", cols=2),
+        )
         return
 
-    # W stanie amount i użytkownik wysłał tekst – traktuj jako sumę
-    amount = parse_amount(text)
-    if amount is not None and amount > 0:
-        pending[chat_id]["amount"] = amount
-        pending[chat_id]["name"] = text[:200] or "Transazione"
-        try:
-            await ask_type(update, context)
-        except Exception as e:
-            print(f"[Bot] Błąd w ask_type: {e}")
-            await msg.reply_text(f"Errore: {e}")
+    if step == "note":
+        # User sent note text (or we treat any text as note)
+        data["note"] = text[:500] if text else ""
+        data["step"] = "done"
+        await _save_and_confirm(update, context, chat_id, data)
+        return
+
+    # Any other step – only amount is valid input; we're waiting for buttons
+    result = parse_amount(text)
+    if result:
+        amount, currency = result
+        STATE[chat_id] = {
+            "step": "type",
+            "amount": amount,
+            "currency": currency,
+        }
+        await update.message.reply_text(
+            "What type of transaction is this?",
+            reply_markup=_keyboard(TRANSACTION_TYPES, "type", cols=2),
+        )
     else:
-        await msg.reply_text("Scrivi un numero (es. 45.50).")
+        await update.message.reply_text("Use the buttons above to choose, or send a new amount to start over.")
 
 
-async def ask_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    msg = update.message or (update.callback_query and update.callback_query.message)
-    if msg is None:
-        print("[Bot] ask_type: msg jest None")
-        return
-    try:
-        await msg.reply_text("Tipo?")
-        await msg.reply_text(
-            "Wybierz:",
-            reply_markup=keyboard(TYPES, "type"),
-        )
-        print(f"[Bot] Tipo? wysłane do {chat_id}")
-    except Exception as e:
-        print(f"[Bot] ask_type reply_text błąd: {e}")
-        raise
-    pending[chat_id]["step"] = "type"
-
-
-async def ask_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    msg = update.message or (update.callback_query and update.callback_query.message)
-    await msg.reply_text(
-        "Categoria?",
-        reply_markup=keyboard(CATEGORIES, "cat", cols=2),
-    )
-    pending[chat_id]["step"] = "category"
-
-
-async def ask_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    msg = update.message or (update.callback_query and update.callback_query.message)
-    await msg.reply_text(
-        "Conto?",
-        reply_markup=keyboard(ACCOUNTS, "acc"),
-    )
-    pending[chat_id]["step"] = "account"
-
-
-async def ask_income_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    msg = update.message or (update.callback_query and update.callback_query.message)
-    await msg.reply_text(
-        "Income Source?",
-        reply_markup=keyboard(INCOME_SOURCES, "src"),
-    )
-    pending[chat_id]["step"] = "income_source"
-
-
-async def ask_transfer_from(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    msg = update.message or (update.callback_query and update.callback_query.message)
-    await msg.reply_text(
-        "Da quale conto? (From)",
-        reply_markup=keyboard(ACCOUNTS, "from_acc"),
-    )
-    pending[chat_id]["step"] = "transfer_from"
-
-
-async def ask_transfer_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    msg = update.message or (update.callback_query and update.callback_query.message)
-    await msg.reply_text(
-        "A quale conto? (To)",
-        reply_markup=keyboard(ACCOUNTS, "to_acc"),
-    )
-    pending[chat_id]["step"] = "transfer_to"
-
-
-async def _handle_expired_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Jeśli sesja wygasła, prosi o kwotę od nowa. Zwraca True jeśli wygasła."""
-    chat_id = update.effective_chat.id
-    if chat_id not in pending:
-        if update.callback_query:
-            await update.callback_query.message.reply_text(
-                "Sessione scaduta. Inviami l'importo (es. 45.50) oppure /add"
-            )
-        pending[chat_id] = {"step": "amount"}
-        return True
-    return False
-
-
-async def save_to_sheets_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    if await _handle_expired_session(update, context):
-        return
-    data = pending[chat_id]
-    try:
-        await asyncio.to_thread(
-            append_transfer,
-            data["from_account"],
-            data["to_account"],
-            float(data["amount"]),
-            data.get("name") or "Trasferimento",
-        )
-    except Exception as e:
-        print(f"[Bot] Błąd Google Sheets (Transfer): {e}")
-        err_msg = str(e)[:80]
-        await update.callback_query.message.reply_text(f"Errore: {err_msg}")
-        return
-    del pending[chat_id]
-    await update.callback_query.message.reply_text("Salvato in Google Sheets (Transfer).")
-
-
-async def save_to_sheets_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    if await _handle_expired_session(update, context):
-        return
-    data = pending[chat_id]
-    try:
-        await asyncio.to_thread(
-            append_income,
-            data.get("income_source", "Salary"),
-            data["account"],
-            float(data["amount"]),
-            data.get("income_source", "Salary"),
-            data.get("name") or "Entrata",
-        )
-    except Exception as e:
-        print(f"[Bot] Błąd Google Sheets (Income): {e}")
-        err_msg = str(e)[:80]
-        await update.callback_query.message.reply_text(f"Errore: {err_msg}")
-        return
-    del pending[chat_id]
-    await update.callback_query.message.reply_text("Salvato in Google Sheets (Income).")
-
-
-async def save_to_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    if await _handle_expired_session(update, context):
-        return
-
-    data = pending[chat_id]
-    note = data.get("name") or "Transazione"
-    try:
-        if data.get("type") == "Investimento":
-            await asyncio.to_thread(
-                append_investment,
-                data["category"],
-                data["account"],
-                float(data["amount"]),
-                note,
-            )
-        else:
-            await asyncio.to_thread(
-                append_expense,
-                data["category"],
-                data["account"],
-                float(data["amount"]),
-                note,
-            )
-    except Exception as e:
-        print(f"[Bot] Błąd Google Sheets (Expense): {e}")
-        err_msg = str(e)[:80]
-        await update.callback_query.message.reply_text(f"Errore: {err_msg}")
-        return
-
-    del pending[chat_id]
-    await update.callback_query.message.reply_text("Salvato in Google Sheets.")
-
-
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    chat_id = update.effective_chat.id
-    data = pending.get(chat_id, {})
-    step = data.get("step")
-    action, value = (q.data.split(":", 1) + [""])[:2]
-    print(f"[Bot] Callback: step={step!r} action={action!r} value={value!r}")
-
     await q.answer()
-    if chat_id not in pending:
-        await q.message.reply_text("Sessione scaduta. Inviami l'importo (es. 45.50) oppure /add")
-        pending[chat_id] = {"step": "amount"}
+    chat_id = q.message.chat.id
+
+    if chat_id not in STATE:
+        await context.bot.send_message(chat_id, "Session expired. Send an amount to start.")
         return
 
-    data = pending[chat_id]
-    step = data.get("step")
-    action, value = (q.data.split(":", 1) + [""])[:2]
+    data = STATE[chat_id]
+    parts = q.data.split(":", 1)
+    action = parts[0]
+    value = parts[1] if len(parts) > 1 else ""
 
-    if step == "type" and action == "type":
+    if action == "type":
         data["type"] = value
-        if value.strip().lower() == "entrata":
-            pending[chat_id]["step"] = "account"
-            await ask_account(update, context)
-        elif value.strip().lower() == "trasferimento":
-            pending[chat_id]["step"] = "transfer_from"
-            await ask_transfer_from(update, context)
+        if value == "Income":
+            data["step"] = "income_category"
+            income_cats = await asyncio.to_thread(get_income_categories_from_sheet)
+            income_buttons = (income_cats or INCOME_CATEGORIES) + ["Add new"]
+            await q.message.reply_text(
+                "Select income category",
+                reply_markup=_keyboard(income_buttons, "inc_cat", cols=2),
+            )
+        elif value == "Transfer":
+            data["step"] = "transfer_from"
+            accounts = await asyncio.to_thread(get_accounts_from_sheet)
+            await q.message.reply_text(
+                "From which account?",
+                reply_markup=_keyboard(accounts or ACCOUNTS, "from_acc", cols=2),
+            )
+        elif value == "Loan Payment":
+            data["step"] = "loan"
+            loans = await asyncio.to_thread(get_loans_from_sheet)
+            if not loans:
+                await q.message.reply_text(
+                    "No loans in the Loans sheet. Add loan names in Loans!A2:A and try again.",
+                )
+                data["step"] = "type"
+                return
+            await q.message.reply_text(
+                "Which loan?",
+                reply_markup=_keyboard(loans, "loan", cols=2),
+            )
         else:
-            await ask_category(update, context)
-    elif step == "transfer_from" and action == "from_acc":
+            data["step"] = "category"
+            categories = await asyncio.to_thread(get_categories_from_sheet)
+            await q.message.reply_text(
+                "Select category",
+                reply_markup=_keyboard(categories or CATEGORIES, "cat", cols=2),
+            )
+
+    elif action == "from_acc":
         data["from_account"] = value
-        await ask_transfer_to(update, context)
-    elif step == "transfer_to" and action == "to_acc":
+        data["step"] = "transfer_to"
+        accounts = await asyncio.to_thread(get_accounts_from_sheet)
+        await q.message.reply_text(
+            "To which account?",
+            reply_markup=_keyboard(accounts or ACCOUNTS, "to_acc", cols=2),
+        )
+
+    elif action == "to_acc":
         data["to_account"] = value
-        await save_to_sheets_transfer(update, context)
-    elif step == "category" and action == "cat":
-        data["category"] = value
-        await ask_account(update, context)
-    elif step == "account" and action == "acc":
-        data["account"] = value
-        if data.get("type") == "Entrata":
-            await ask_income_source(update, context)
+        data["step"] = "note"
+        await q.message.reply_text(
+            "Add a note? (optional)\n\nType a note or press Skip.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Skip", callback_data="note:__skip__")],
+            ]),
+        )
+
+    elif action == "loan":
+        data["loan"] = value  # loan name -> Category (C) for Loans formula
+        data["step"] = "loan_account"
+        accounts = await asyncio.to_thread(get_accounts_from_sheet)
+        await q.message.reply_text(
+            "From which account? (paying from)",
+            reply_markup=_keyboard(accounts or ACCOUNTS, "loan_acc", cols=2),
+        )
+
+    elif action == "loan_acc":
+        data["account"] = value  # bank account (Santander Paolo) -> D
+        data["category"] = data.get("loan", "")  # loan name -> C for Loans formula
+        data["step"] = "note"
+        await q.message.reply_text(
+            "Add a note? (optional)\n\nType a note or press Skip.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Skip", callback_data="note:__skip__")],
+            ]),
+        )
+
+    elif action == "inc_cat":
+        if value == "Add new":
+            data["step"] = "income_category_new"
+            await q.message.reply_text("Enter the new category name (e.g. Freelance, Bonus):")
         else:
-            await save_to_sheets(update, context)
-    elif step == "income_source" and action == "src":
-        data["income_source"] = value
-        await save_to_sheets_income(update, context)
+            data["category"] = value
+            data["step"] = "account"
+            accounts = await asyncio.to_thread(get_accounts_from_sheet)
+            await q.message.reply_text(
+                "Select account",
+                reply_markup=_keyboard(accounts or ACCOUNTS, "acc", cols=2),
+            )
+
+    elif action == "cat":
+        data["category"] = value
+        data["step"] = "account"
+        accounts = await asyncio.to_thread(get_accounts_from_sheet)
+        await q.message.reply_text(
+            "Select account",
+            reply_markup=_keyboard(accounts or ACCOUNTS, "acc", cols=2),
+        )
+
+    elif action == "acc":
+        data["account"] = value
+        data["step"] = "note"
+        await q.message.reply_text(
+            "Add a note? (optional)\n\nType a note or press Skip.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Skip", callback_data="note:__skip__")],
+            ]),
+        )
+
+    elif action == "note" and value == "__skip__":
+        data["note"] = ""
+        data["step"] = "done"
+        await _save_and_confirm(update, context, chat_id, data)
+
+
+async def _save_and_confirm(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    data: dict,
+) -> None:
+    """Write transaction to Sheets and send confirmation."""
+    try:
+        if data.get("type") == "Transfer":
+            await asyncio.to_thread(
+                append_transfer,
+                data.get("from_account", ""),
+                data.get("to_account", ""),
+                data.get("amount", 0),
+                data.get("currency", "EUR"),
+                date.today(),
+                data.get("note", ""),
+            )
+            payload = {
+                "type": "Transfer",
+                "amount": data.get("amount", 0),
+                "currency": data.get("currency", "EUR"),
+                "note": data.get("note", ""),
+            }
+        else:
+            raw_amount = data.get("amount", 0)
+            # Expense, Loan Payment = minus (outflow); Income = plus (inflow)
+            if data.get("type") in ("Expense", "Loan Payment"):
+                amount = -abs(float(raw_amount))
+            else:
+                amount = abs(float(raw_amount))
+            payload = {
+                "date": date.today(),
+                "type": data.get("type", ""),
+                "category": data.get("category", ""),
+                "account": data.get("account", ""),
+                "amount": amount,
+                "currency": data.get("currency", "EUR"),
+                "note": data.get("note", ""),
+            }
+            await asyncio.to_thread(append_transaction, payload)
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"Error saving: {str(e)[:200]}")
+        return
+    finally:
+        if chat_id in STATE:
+            del STATE[chat_id]
+
+    msg = (
+        "Transaction saved ✅\n\n"
+        f"Amount: {payload['amount']} {payload['currency']}\n"
+        f"Type: {payload['type']}\n"
+    )
+    if payload["type"] == "Transfer":
+        msg += f"From: {data.get('from_account', '')} → To: {data.get('to_account', '')}\n"
+    elif payload["type"] == "Loan Payment":
+        msg += f"Loan: {data.get('loan', '')}\nAccount: {payload['account']}\n"
     else:
-        print(f"[Bot] Callback nie dopasowany: step={step!r} action={action!r}")
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    err = context.error
-    print(f"[Bot] Nieobsłużony błąd: {err}")
-    if update and isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text(f"Errore: {str(err)[:80]}")
+        msg += f"Category: {payload['category']}\nAccount: {payload['account']}\n"
+    if payload.get("note"):
+        msg += f"\nNote: {payload['note'][:100]}"
+    await context.bot.send_message(chat_id, msg)
 
 
 def main() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise SystemExit("Ustaw TELEGRAM_BOT_TOKEN w .env")
+    token = config.get_telegram_token()
+    # Validate Google config on startup
+    config.get_google_sheet_id()
+    config.get_google_credentials()
 
     app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), handle_message))
-    app.add_handler(CallbackQueryHandler(callback))
-    app.add_error_handler(error_handler)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(CallbackQueryHandler(on_callback))
 
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    if not token or ":" not in token:
-        raise SystemExit("Błąd: TELEGRAM_BOT_TOKEN w .env jest pusty lub w złym formacie.")
-    spreadsheet_id = os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID", "")
-    if not spreadsheet_id:
-        raise SystemExit("Błąd: GOOGLE_SHEETS_SPREADSHEET_ID w .env jest pusty.")
-    print("Bot uruchomiony. Wyślij /start do bota w Telegramie.")
-    print("(Ctrl+C = wyjście)\n")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("Bot running. Send an amount in Telegram to start.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":

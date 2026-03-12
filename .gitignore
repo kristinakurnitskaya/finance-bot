@@ -1,4 +1,6 @@
 .env
+.bot.lock
+.state.json
 .venv/
 venv/
 __pycache__/
